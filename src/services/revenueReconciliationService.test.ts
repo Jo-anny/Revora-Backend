@@ -6,6 +6,8 @@ import { InvestmentRepository } from '../db/repositories/investmentRepository';
 import { OfferingRepository } from '../db/repositories/offeringRepository';
 import { logger } from '../lib/logger';
 import { StellarTransactionVerifier } from '../lib/stellarTransactionVerifier';
+import fc from 'fast-check';
+import { Decimal } from '../lib/decimal';
 
 jest.mock('../db/repositories/revenueReportRepository');
 jest.mock('../db/repositories/distributionRepository');
@@ -65,6 +67,70 @@ describe('RevenueReconciliationService', () => {
     service = new RevenueReconciliationService(mockDb, mockStellarClient, mockTxVerifier);
   });
 
+  describe('exact decimal reconciliation', () => {
+    const amountHelpers = () => service as unknown as {
+      sumRevenueAmounts: (reports: Array<{ amount?: string }>) => string;
+    };
+
+    it('reports a sub-cent revenue mismatch when tolerance is zero', async () => {
+      (RevenueReportRepository.prototype.listByOffering as jest.Mock).mockResolvedValue([
+        { amount: '0.0000000001', period_start: periodStart, period_end: periodEnd },
+      ]);
+      (DistributionRepository.prototype.listByOffering as jest.Mock).mockResolvedValue([
+        {
+          id: 'run-1',
+          total_amount: '0',
+          distribution_date: new Date('2023-01-15'),
+          status: 'completed',
+          offering_id: offeringId,
+        },
+      ]);
+      (OfferingRepository.prototype.findById as jest.Mock).mockResolvedValue(null);
+
+      const result = await service.reconcile(offeringId, periodStart, periodEnd, {
+        tolerance: 0,
+      });
+
+      const mismatch = result.discrepancies.find(
+        (discrepancy) => discrepancy.type === 'REVENUE_MISMATCH',
+      );
+      expect(mismatch?.details.difference).toBe('0.0000000001');
+    });
+
+    it('sums amounts beyond JavaScript safe integer precision exactly', () => {
+      const total = amountHelpers().sumRevenueAmounts([
+        { amount: '12345678901234567.0000000001' },
+        { amount: '0.0000000009' },
+      ]);
+      expect(total).toBe('12345678901234567.0000000010');
+    });
+
+    it('sums arbitrary decimal parts exactly', () => {
+      const partsArbitrary = fc.array(
+        fc.bigInt({ min: -(10n ** 24n), max: 10n ** 24n }),
+        { minLength: 1, maxLength: 20 },
+      );
+
+      fc.assert(
+        fc.property(partsArbitrary, (scaledParts) => {
+          const parts = scaledParts.map((part) =>
+            Decimal.fromScaledBigInt(part, 10).toString(),
+          );
+          const expected = parts.reduce(
+            (sum, part) => sum.add(new Decimal(part)),
+            new Decimal('0'),
+          );
+          const actual = amountHelpers().sumRevenueAmounts(
+            parts.map((amount) => ({ amount })),
+          );
+          expect(actual).toBe(
+            expected.add(new Decimal('0.0000000000')).toString(),
+          );
+        }),
+      );
+    });
+  });
+
   describe('reconcile', () => {
     it('should return balanced result when there is no discrepancy or drift', async () => {
       const mockRevenueReports = [{ amount: '1000.00', period_start: periodStart, period_end: periodEnd }];
@@ -83,8 +149,8 @@ describe('RevenueReconciliationService', () => {
 
       expect(result.isBalanced).toBe(true);
       expect(result.discrepancies).toHaveLength(0);
-      expect(result.summary.totalRevenueReported).toBe('1000.00');
-      expect(result.summary.totalPayouts).toBe('1000.00');
+      expect(result.summary.totalRevenueReported).toBe('1000.0000000000');
+      expect(result.summary.totalPayouts).toBe('1000.0000000000');
     });
 
     it('should detect revenue mismatch when reported != paid', async () => {
@@ -259,7 +325,7 @@ describe('RevenueReconciliationService', () => {
       (OfferingRepository.prototype.findById as jest.Mock).mockResolvedValue({ id: offeringId });
       const result = await service.detectChainDrift(offeringId);
       expect(result.hasDrift).toBe(false);
-      expect(result.onChainAmount).toBe('0.00');
+      expect(result.onChainAmount).toBe('0.0000000000');
     });
   });
 

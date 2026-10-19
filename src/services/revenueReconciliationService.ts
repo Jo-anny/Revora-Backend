@@ -27,6 +27,7 @@ import {
   StellarRPCFailureContext 
 } from '../lib/stellarRpcFailure';
 import { Errors } from '../lib/errors';
+import { Decimal } from '../lib/decimal';
 import { 
   StellarTransactionVerifier,
   TransactionVerificationResult 
@@ -135,7 +136,7 @@ export class RevenueReconciliationService {
     periodEnd: Date,
     options: ReconciliationOptions = {}
   ): Promise<ReconciliationResult> {
-    const tolerance = options.tolerance ?? DEFAULT_TOLERANCE;
+    const tolerance = String(options.tolerance ?? DEFAULT_TOLERANCE);
     const discrepancies: ReconciliationDiscrepancy[] = [];
 
     this.logger.info(
@@ -195,7 +196,9 @@ export class RevenueReconciliationService {
           if (driftResult.hasDrift) {
             discrepancies.push({
               type: 'CHAIN_DRIFT_DETECTED',
-              severity: parseFloat(driftResult.drift) > tolerance * 10 ? 'critical' : 'error',
+              severity: new Decimal(driftResult.drift).compareTo(
+                new Decimal(tolerance).multiply(new Decimal('10')),
+              ) > 0 ? 'critical' : 'error',
               message: `On-chain drift detected for offering ${offeringId}: local ${driftResult.localAmount} vs chain ${driftResult.onChainAmount}`,
               details: driftResult,
               offeringId,
@@ -418,7 +421,11 @@ export class RevenueReconciliationService {
     const totalPayouts = this.sumDistributionAmounts(relevantRuns);
 
     return {
-      isBalanced: this.amountsEqual(totalRevenue, totalPayouts, DEFAULT_TOLERANCE),
+      isBalanced: this.amountsEqual(
+        totalRevenue,
+        totalPayouts,
+        String(DEFAULT_TOLERANCE),
+      ),
       difference: this.subtractAmounts(totalRevenue, totalPayouts),
     };
   }
@@ -508,45 +515,47 @@ export class RevenueReconciliationService {
     if (!offering || !offering.contract_address) {
       return {
         hasDrift: false,
-        onChainAmount: '0.00',
-        localAmount: '0.00',
-        drift: '0.00',
+        onChainAmount: '0.0000000000',
+        localAmount: '0.0000000000',
+        drift: '0.0000000000',
       };
     }
 
     const onChainState = await this.stellarClient.getRevenueState(offering.contract_address);
     const stats = await this.distributionRepo.getAggregateStats(offeringId);
 
-    const onChainAmount = parseFloat(onChainState.totalDistributed);
-    const localAmount = parseFloat(stats.totalDistributed);
-    const drift = Math.abs(onChainAmount - localAmount);
-
-    const hasDrift = drift > DEFAULT_TOLERANCE;
+    const onChainAmount = new Decimal(onChainState.totalDistributed);
+    const localAmount = new Decimal(stats.totalDistributed);
+    const driftDifference = onChainAmount.subtract(localAmount);
+    const drift = driftDifference.compareTo(new Decimal('0')) < 0
+      ? new Decimal('0').subtract(driftDifference)
+      : driftDifference;
+    const hasDrift = drift.compareTo(new Decimal(String(DEFAULT_TOLERANCE))) > 0;
 
     return {
       hasDrift,
-      onChainAmount: onChainAmount.toFixed(2),
-      localAmount: localAmount.toFixed(2),
-      drift: drift.toFixed(2),
+      onChainAmount: this.toNativeAmountScale(onChainAmount.toString()),
+      localAmount: this.toNativeAmountScale(localAmount.toString()),
+      drift: this.toNativeAmountScale(drift.toString()),
     };
   }
 
   private checkRevenueMismatch(
     totalRevenue: string,
     totalPayouts: string,
-    tolerance: number
+    tolerance: string
   ): ReconciliationDiscrepancy | null {
-    const diff = Math.abs(parseFloat(totalRevenue) - parseFloat(totalPayouts));
+    const diff = this.absoluteDifference(totalRevenue, totalPayouts);
 
-    if (diff > tolerance) {
+    if (diff.compareTo(new Decimal(tolerance)) > 0) {
       return {
         type: 'REVENUE_MISMATCH',
-        severity: diff > 1 ? 'critical' : 'error',
+        severity: diff.compareTo(new Decimal('1')) > 0 ? 'critical' : 'error',
         message: `Revenue mismatch detected: reported ${totalRevenue} vs payouts ${totalPayouts}`,
         details: {
           reported: totalRevenue,
           paid: totalPayouts,
-          difference: diff.toFixed(2),
+          difference: this.toNativeAmountScale(diff.toString()),
         },
         offeringId: '',
       };
@@ -557,7 +566,7 @@ export class RevenueReconciliationService {
 
   private async checkDistributionRunIntegrity(
     run: DistributionRun,
-    tolerance: number
+    tolerance: string
   ): Promise<ReconciliationDiscrepancy[]> {
     const discrepancies: ReconciliationDiscrepancy[] = [];
 
@@ -587,7 +596,7 @@ export class RevenueReconciliationService {
   private async checkInvestorAllocations(
     offeringId: string,
     runs: DistributionRun[],
-    tolerance: number
+    tolerance: string
   ): Promise<ReconciliationDiscrepancy[]> {
     const discrepancies: ReconciliationDiscrepancy[] = [];
     const investments = await this.investmentRepo.findByOffering(offeringId);
@@ -631,19 +640,26 @@ export class RevenueReconciliationService {
     for (const run of runs) {
       if (run.status !== 'completed') continue;
 
-      const totalAmount = parseFloat(run.total_amount);
-      const roundedAmount = Math.round(totalAmount * 100) / 100;
+      const totalAmount = new Decimal(run.total_amount);
+      const roundedAmount = Decimal.fromScaledBigInt(
+        totalAmount.toSorobanI128(2, 'round'),
+        2,
+      );
+      const loss = totalAmount.subtract(roundedAmount);
+      const absoluteLoss = loss.compareTo(new Decimal('0')) < 0
+        ? new Decimal('0').subtract(loss)
+        : loss;
 
-      if (Math.abs(totalAmount - roundedAmount) > 0.001) {
+      if (absoluteLoss.compareTo(new Decimal('0.001')) > 0) {
         discrepancies.push({
           type: 'ROUNDING_LOSS_UNACCOUNTED',
           severity: 'warning',
           message: `Potential rounding loss in run ${run.id}`,
           details: {
             runId: run.id,
-            originalAmount: totalAmount,
-            roundedAmount,
-            loss: (totalAmount - roundedAmount).toFixed(4),
+            originalAmount: totalAmount.toString(),
+            roundedAmount: roundedAmount.toString(),
+            loss: this.toNativeAmountScale(loss.toString()),
           },
           offeringId: run.offering_id,
         });
@@ -677,28 +693,48 @@ export class RevenueReconciliationService {
   }
 
   private sumRevenueAmounts(reports: RevenueReport[]): string {
-    return reports
-      .reduce((sum, r) => sum + parseFloat(r.amount ?? '0'), 0)
-      .toFixed(2);
+    const total = reports.reduce(
+      (sum, report) => sum.add(new Decimal(report.amount ?? '0')),
+      new Decimal('0'),
+    );
+    return this.toNativeAmountScale(total.toString());
   }
 
   private sumDistributionAmounts(runs: DistributionRun[]): string {
-    return runs
-      .filter((r) => r.status === 'completed')
-      .reduce((sum, r) => sum + parseFloat(r.total_amount), 0)
-      .toFixed(2);
+    const total = runs
+      .filter((run) => run.status === 'completed')
+      .reduce(
+        (sum, run) => sum.add(new Decimal(run.total_amount)),
+        new Decimal('0'),
+      );
+    return this.toNativeAmountScale(total.toString());
   }
 
-  private amountsEqual(a: string, b: string, tolerance: number): boolean {
-    return Math.abs(parseFloat(a) - parseFloat(b)) <= tolerance;
+  private amountsEqual(a: string, b: string, tolerance: string): boolean {
+    return this.absoluteDifference(a, b).compareTo(new Decimal(tolerance)) <= 0;
   }
 
   private subtractAmounts(a: string, b: string): string {
-    return (parseFloat(a) - parseFloat(b)).toFixed(2);
+    return this.toNativeAmountScale(new Decimal(a).subtract(new Decimal(b)).toString());
   }
 
   private calculateDiscrepancyAmount(revenue: string, payouts: string): string {
-    return Math.abs(parseFloat(revenue) - parseFloat(payouts)).toFixed(2);
+    return this.toNativeAmountScale(
+      this.absoluteDifference(revenue, payouts).toString(),
+    );
+  }
+
+  private absoluteDifference(a: string, b: string): Decimal {
+    const first = new Decimal(a);
+    const second = new Decimal(b);
+    const difference = first.subtract(second);
+    return difference.compareTo(new Decimal('0')) < 0
+      ? new Decimal('0').subtract(difference)
+      : difference;
+  }
+
+  private toNativeAmountScale(amount: string): string {
+    return new Decimal(amount).add(new Decimal('0.0000000000')).toString();
   }
 
   private isValidDistributionStatus(
